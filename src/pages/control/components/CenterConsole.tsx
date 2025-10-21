@@ -1,5 +1,6 @@
-import type { CSSProperties } from 'react';
-import type { FallbackAssets, MixDeck } from '../../../types/realtime';
+import { useEffect, useRef, type CSSProperties } from 'react';
+import { useRTCStreaming } from '../../../modules/useRTCStreaming';
+import type { FallbackAssets, MixDeck, RTCSignalMessage } from '../../../types/realtime';
 import type { ViewerStatus } from '../../../types/realtime';
 import type { DeckKey } from '../../../utils/mix';
 import { deckLabels, masterPreviewOrder } from '../constants';
@@ -16,6 +17,9 @@ type CenterConsoleProps = {
   crossfaderValue: number;
   onCrossfaderChange: (value: number) => void;
   masterPreviewRefs: Record<DeckKey, (element: HTMLVideoElement | null) => void>;
+  rtcSignal: RTCSignalMessage | null;
+  onSendRTCSignal: (signal: Omit<RTCSignalMessage, 'type'>) => void;
+  onConsumeRTCSignal: () => void;
 };
 
 const renderMasterPreviewLayer = (
@@ -51,7 +55,6 @@ const renderMasterPreviewLayer = (
       <video
         key={videoKey}
         className="master-preview-layer"
-        src={video.url}
         muted
         loop
         playsInline
@@ -93,20 +96,88 @@ export const CenterConsole = ({
   crossfaderValue,
   onCrossfaderChange,
   masterPreviewRefs,
+  rtcSignal,
+  onSendRTCSignal,
+  onConsumeRTCSignal,
 }: CenterConsoleProps) => {
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const {
+    connectionState: rtcConnectionState,
+    initViewer,
+    addRemoteIceCandidate,
+    closeConnection,
+  } = useRTCStreaming(onSendRTCSignal);
+  const isStreamConnected = rtcConnectionState === 'connected';
+  const isStreamConnecting = rtcConnectionState === 'connecting';
+
+  useEffect(() => {
+    const videoElement = previewVideoRef.current;
+    return () => {
+      if (videoElement) {
+        videoElement.srcObject = null;
+      }
+      closeConnection();
+    };
+  }, [closeConnection]);
+
+  useEffect(() => {
+    if (!rtcSignal) {
+      return;
+    }
+
+    const processSignal = async () => {
+      let shouldConsume = true;
+      try {
+        if (rtcSignal.rtc === 'offer') {
+          const videoElement = previewVideoRef.current;
+          if (!videoElement) {
+            await new Promise<void>((resolve) => {
+              requestAnimationFrame(() => resolve());
+            });
+          }
+          const resolvedVideoElement = previewVideoRef.current;
+          if (!resolvedVideoElement) {
+            shouldConsume = false;
+            return;
+          }
+          const answer = await initViewer(rtcSignal.payload, resolvedVideoElement);
+          if (answer) {
+            onSendRTCSignal({ rtc: 'answer', payload: answer });
+          }
+        } else if (rtcSignal.rtc === 'ice-candidate') {
+          await addRemoteIceCandidate(rtcSignal.payload);
+        }
+      } catch (error) {
+        console.error('CenterConsole: failed to process RTC signal.', error);
+      } finally {
+        if (shouldConsume) {
+          onConsumeRTCSignal();
+        }
+      }
+    };
+
+    void processSignal();
+  }, [rtcSignal, initViewer, addRemoteIceCandidate, onSendRTCSignal, onConsumeRTCSignal]);
+
   const hasMixDeckEnabled = Object.values(decks).some((deck) => deck?.enabled);
   const hasActiveMixOutput = Object.values(deckMixOutputs).some((value) => value > 0.001);
 
-  const previewBadge = viewerStatus.isRunning
-    ? 'LIVE MIX'
-    : hasMixDeckEnabled
-      ? 'PREVIEW'
-      : 'STANDBY';
-  const previewMessage = viewerStatus.isRunning
-    ? 'Streaming to viewer output'
-    : hasActiveMixOutput
-      ? 'Currently mixing active decks'
-      : 'Start to render generative mix';
+  const previewBadge = isStreamConnected
+    ? 'VIEWER FEED'
+    : viewerStatus.isRunning
+      ? 'LIVE MIX'
+      : hasMixDeckEnabled
+        ? 'PREVIEW'
+        : 'STANDBY';
+  const previewMessage = isStreamConnected
+    ? 'Displaying live viewer output'
+    : isStreamConnecting
+      ? 'Connecting to viewer feed'
+      : viewerStatus.isRunning
+        ? 'Streaming to viewer output'
+        : hasActiveMixOutput
+          ? 'Currently mixing active decks'
+          : 'Start to render generative mix';
 
   const crossfaderPercent = Math.max(0, Math.min(100, crossfaderValue * 100));
   const crossfaderStyle: CSSVariableProperties = {
@@ -118,12 +189,32 @@ export const CenterConsole = ({
     <div className="dj-center-console control-card">
       <div className="dj-center-preview">
         <div className="master-preview-window">
+          <video
+            ref={previewVideoRef}
+            className="master-preview-stream"
+            autoPlay
+            playsInline
+            muted
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              opacity: isStreamConnected ? 1 : 0,
+              zIndex: isStreamConnected ? 2 : 0,
+              pointerEvents: 'none',
+              transition: 'opacity 120ms ease',
+            }}
+          />
           <div className={`master-preview-screen ${viewerStatus.isRunning ? 'live' : 'idle'}`}>
-            <div className="master-preview-layers" aria-hidden="true">
-              {masterPreviewOrder.map((key) =>
-                renderMasterPreviewLayer(key, decks, deckMixOutputs, assets, masterPreviewRefs),
-              )}
-            </div>
+            {!isStreamConnected && (
+              <div className="master-preview-layers" aria-hidden="true">
+                {masterPreviewOrder.map((key) =>
+                  renderMasterPreviewLayer(key, decks, deckMixOutputs, assets, masterPreviewRefs),
+                )}
+              </div>
+            )}
             <div className="master-preview-status sr-only">
               <span className="master-badge">{previewBadge}</span>
               <span className="master-preview-message">{previewMessage}</span>
@@ -160,6 +251,10 @@ export const CenterConsole = ({
           <div className="dj-center-status">
             <span>Status: {viewerStatus.isRunning ? 'Running' : 'Idle'}</span>
             <span>Generating: {viewerStatus.isGenerating ? 'Yes' : 'No'}</span>
+            <span>
+              Viewer Link:{' '}
+              {isStreamConnected ? 'Connected' : isStreamConnecting ? 'Negotiating' : 'Waiting'}
+            </span>
             {viewerStatus.error && <span className="control-error">{viewerStatus.error}</span>}
           </div>
         </div>

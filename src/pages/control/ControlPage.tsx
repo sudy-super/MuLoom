@@ -6,7 +6,7 @@ import {
   useState,
 } from 'react';
 import { useRealtime } from '../../modules/useRealtime';
-import type { MixDeck } from '../../types/realtime';
+import type { MixDeck, RTCSignalMessage } from '../../types/realtime';
 import type { DeckKey } from '../../utils/mix';
 import { computeDeckMix } from '../../utils/mix';
 import type { ModelProvider } from '../../modules/GLSLGenerator';
@@ -81,11 +81,17 @@ const ControlPage = () => {
   const [dropTargetDeck, setDropTargetDeck] = useState<DeckKey | null>(null);
   const [activeContentTab, setActiveContentTab] = useState<ContentTab>('generative');
   const [selectedAssetValue, setSelectedAssetValue] = useState<string | null>(null);
+  const [rtcSignalQueue, setRtcSignalQueue] = useState<RTCSignalMessage[]>([]);
 
-  const { viewerStatus, send, controlSettings, assets, mixState } = useRealtime('controller', {
+  const { connectionState, viewerStatus, send, controlSettings, assets, mixState } = useRealtime('controller', {
     onCodeProgress: (progress) => {
       setLatestCode(progress.code);
       setIsGenerating(!progress.isComplete);
+    },
+    onRTCSignal: (signal) => {
+      if (signal.rtc === 'offer' || signal.rtc === 'ice-candidate') {
+        setRtcSignalQueue((previous) => [...previous, signal]);
+      }
     },
   });
 
@@ -95,6 +101,19 @@ const ControlPage = () => {
     c: mixState?.decks?.c ?? { ...emptyDeck },
     d: mixState?.decks?.d ?? { ...emptyDeck },
   };
+
+  const currentRtcSignal = rtcSignalQueue.length > 0 ? rtcSignalQueue[0] : null;
+
+  useEffect(() => {
+    if (connectionState !== 'open') {
+      return;
+    }
+    send({
+      type: 'rtc-signal',
+      rtc: 'request-offer',
+      payload: null,
+    });
+  }, [connectionState, send]);
 
   const deckHasVideo = useMemo(
     () => ({
@@ -143,6 +162,42 @@ const ControlPage = () => {
     [playVideo, registerVideo],
   );
 
+  const broadcastDeckMediaState = useCallback(
+    (deckKey: DeckKey, state: DeckMediaState) => {
+      send({
+        type: 'deck-media-state',
+        payload: {
+          deck: deckKey,
+          state: {
+            ...state,
+            src: state.src ?? null,
+          },
+        },
+      });
+    },
+    [send],
+  );
+
+  const consumeRtcSignal = useCallback(() => {
+    setRtcSignalQueue((previous) => {
+      if (previous.length === 0) {
+        return previous;
+      }
+      return previous.slice(1);
+    });
+  }, []);
+
+  const handleSendRtcSignal = useCallback(
+    (signal: Omit<RTCSignalMessage, 'type'>) => {
+      send({
+        type: 'rtc-signal',
+        rtc: signal.rtc,
+        payload: signal.payload,
+      });
+    },
+    [send],
+  );
+
   useEffect(() => {
     localStorage.setItem('gemini-api-key', geminiApiKey);
   }, [geminiApiKey]);
@@ -172,20 +227,30 @@ const ControlPage = () => {
       const masterId = `master-${deckKey}`;
 
       return addEventListener(deckId, (state, details) => {
+        let nextStateForBroadcast: DeckMediaState | null = null;
         setDeckStates((previous) => {
           const current = previous[deckKey] ?? createDefaultDeckMediaState()[deckKey];
           const progressDetail =
             typeof details?.progress === 'number' ? (details.progress as number) : current.progress;
           const clampedProgress = Math.max(0, Math.min(100, progressDetail));
-          const detailSrc = typeof details?.src === 'string' ? (details.src as string) : null;
+          const normalizeSrc = (value: unknown) => {
+            if (typeof value !== 'string') {
+              return null;
+            }
+            const trimmed = value.trim();
+            return trimmed.length > 0 ? trimmed : null;
+          };
+          const detailSrc = normalizeSrc(details?.src);
           const managerState = getState(deckId);
-          const nextSrc = detailSrc ?? (typeof managerState.src === 'string' ? managerState.src : current.src);
+          const managerSrc = normalizeSrc(managerState.src);
+          const currentSrc = normalizeSrc(current.src);
+          const nextSrc = detailSrc ?? managerSrc ?? currentSrc ?? null;
           const nextState: DeckMediaState = {
             isPlaying: state === 'playing',
             progress: clampedProgress,
             isLoading: state === 'loading',
             error: state === 'error',
-            src: nextSrc ?? null,
+            src: nextSrc,
           };
           if (
             current.isPlaying === nextState.isPlaying &&
@@ -196,11 +261,21 @@ const ControlPage = () => {
           ) {
             return previous;
           }
+          nextStateForBroadcast = nextState;
           return {
             ...previous,
             [deckKey]: nextState,
           };
         });
+
+        if (nextStateForBroadcast) {
+          broadcastDeckMediaState(deckKey, nextStateForBroadcast);
+        }
+
+        if (state === 'ready' && desiredDeckPlaybackRef.current[deckKey]) {
+          void playVideo(deckId);
+          void playVideo(masterId);
+        }
 
         if (state === 'playing' || state === 'paused') {
           const progressDetail =
@@ -220,10 +295,6 @@ const ControlPage = () => {
           setDesiredDeckPlayback((previous) =>
             previous[deckKey] ? previous : { ...previous, [deckKey]: true },
           );
-        } else if (state === 'error') {
-          setDesiredDeckPlayback((previous) =>
-            previous[deckKey] ? { ...previous, [deckKey]: false } : previous,
-          );
         }
       });
     });
@@ -231,7 +302,7 @@ const ControlPage = () => {
     return () => {
       unsubscribes.forEach((unsubscribe) => unsubscribe());
     };
-  }, [addEventListener, getState, pauseVideo, playVideo, seekToPercent]);
+  }, [addEventListener, broadcastDeckMediaState, getState, pauseVideo, playVideo, seekToPercent]);
 
   useEffect(() => {
     let cancelled = false;
@@ -247,16 +318,30 @@ const ControlPage = () => {
             const video =
               assets.videos.find((item) => item.id === deck.assetId) ??
               assets.overlays?.find((item) => item.id === deck.assetId);
+
             if (video && 'url' in video) {
+              const shouldPlay = desiredDeckPlaybackRef.current[deckKey];
+
+              if (shouldPlay) {
+                void playVideo(deckId);
+                void playVideo(masterId);
+              }
+
               await loadSource(deckId, video.url);
               if (cancelled) return;
               await loadSource(masterId, video.url);
               if (cancelled) return;
 
-              const shouldPlay = desiredDeckPlayback[deckKey];
               if (shouldPlay) {
-                void playVideo(deckId);
-                void playVideo(masterId);
+                const deckManagerState = getState(deckId);
+                const masterManagerState = getState(masterId);
+
+                if (deckManagerState.state !== 'playing' && !deckManagerState.pendingPlay) {
+                  void playVideo(deckId);
+                }
+                if (masterManagerState.state !== 'playing' && !masterManagerState.pendingPlay) {
+                  void playVideo(masterId);
+                }
               } else {
                 pauseVideo(deckId);
                 pauseVideo(masterId);
@@ -286,7 +371,7 @@ const ControlPage = () => {
     return () => {
       cancelled = true;
     };
-  }, [assets.overlays, assets.videos, decks, desiredDeckPlayback, loadSource, pauseVideo, playVideo]);
+  }, [assets.overlays, assets.videos, decks, getState, loadSource, pauseVideo, playVideo]);
 
   useEffect(() => {
     deckKeys.forEach((deckKey) => {
@@ -619,7 +704,8 @@ const ControlPage = () => {
           return <div className="deck-preview-placeholder">Video error</div>;
         }
         const videoKey = `${deckKey}-${video.id}`;
-        const resolvedSrc = deckState.src ??
+        const resolvedSrc =
+          (typeof deckState.src === 'string' && deckState.src.length > 0 ? deckState.src : undefined) ||
           (typeof video.url === 'string' && video.url.length > 0 ? video.url : undefined);
         return (
           <video
@@ -691,6 +777,9 @@ const ControlPage = () => {
             crossfaderValue={crossfaderDisplayValue}
             onCrossfaderChange={handleCrossfaderChange}
             masterPreviewRefs={masterPreviewVideoRefCallbacks}
+            rtcSignal={currentRtcSignal}
+            onSendRTCSignal={handleSendRtcSignal}
+            onConsumeRTCSignal={consumeRtcSignal}
           />
           <DeckColumn
             deckKey="b"

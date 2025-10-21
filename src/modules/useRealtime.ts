@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ControlSettings,
+  DeckMediaStatus,
+  DeckMediaStatusMap,
   FallbackAssets,
   FallbackLayer,
   InboundMessage,
   MixDeck,
   MixState,
   OutboundMessage,
+  RTCSignalMessage,
   StartVisualizationPayload,
   ViewerStatus,
 } from '../types/realtime';
+import { createDefaultDeckMediaStatus } from '../types/realtime';
+import { MIX_DECK_KEYS, type DeckKey } from '../utils/mix';
 
-const MIX_DECK_KEYS = ['a', 'b', 'c', 'd'] as const;
 const EMPTY_DECK: MixDeck = { type: null, assetId: null, opacity: 0, enabled: false };
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
@@ -66,6 +70,7 @@ export interface RealtimeHandlers {
   onRegenerateShader?: () => void;
   onSetAudioSensitivity?: (value: number) => void;
   onCodeProgress?: (payload: { code: string; isComplete: boolean }) => void;
+  onRTCSignal?: (signal: RTCSignalMessage) => void;
 }
 
 export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHandlers = {}) {
@@ -88,10 +93,45 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
       overlays: [],
     }),
   );
+  const createDefaultDeckMediaStates = useCallback((): DeckMediaStatusMap => {
+    const map = {} as DeckMediaStatusMap;
+    MIX_DECK_KEYS.forEach((key) => {
+      map[key] =(createDefaultDeckMediaStatus());
+    });
+    return map;
+  }, []);
+
+  const normaliseDeckMediaStates = useCallback(
+    (incoming?: Partial<Record<DeckKey, DeckMediaStatus>> | null): DeckMediaStatusMap => {
+      const base = createDefaultDeckMediaStates();
+      if (!incoming) {
+        return base;
+      }
+      const next = { ...base };
+      MIX_DECK_KEYS.forEach((key) => {
+        const source = incoming[key];
+        if (source) {
+          next[key] = {
+            isPlaying: Boolean(source.isPlaying),
+            progress: Math.max(0, Math.min(100, Number(source.progress ?? 0))),
+            isLoading: Boolean(source.isLoading),
+            error: Boolean(source.error),
+            src:
+              typeof source.src === 'string' && source.src.trim().length > 0
+                ? source.src
+                : null,
+          };
+        }
+      });
+      return next;
+    },
+    [createDefaultDeckMediaStates],
+  );
+
   const normaliseMixState = useCallback((incoming?: Partial<MixState> | null): MixState => {
     const source = incoming ?? {};
-    const decks = (source.decks ?? {}) as Partial<Record<typeof MIX_DECK_KEYS[number], MixDeck>>;
-    const normalisedDecks = {} as Record<typeof MIX_DECK_KEYS[number], MixDeck>;
+    const decks = (source.decks ?? {}) as Partial<Record<DeckKey, MixDeck>>;
+    const normalisedDecks = {} as Record<DeckKey, MixDeck>;
     MIX_DECK_KEYS.forEach((key) => {
       normalisedDecks[key] = { ...EMPTY_DECK, ...(decks[key] ?? {}) };
     });
@@ -106,6 +146,9 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
   }, []);
 
   const [mixState, setMixState] = useState<MixState>(() => normaliseMixState());
+  const [deckMediaStates, setDeckMediaStates] = useState<DeckMediaStatusMap>(
+    () => createDefaultDeckMediaStates(),
+  );
 
   const wsRef = useRef<WebSocket | null>(null);
   const handlersRef = useRef(handlers);
@@ -151,6 +194,10 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     ws.onmessage = (event) => {
       try {
         const message: InboundMessage = JSON.parse(event.data);
+        if (message.type === 'rtc-signal') {
+          handlersRef.current.onRTCSignal?.(message);
+          return;
+        }
         switch (message.type) {
           case 'init': {
             setFallbackLayers(message.payload.state.fallbackLayers);
@@ -160,6 +207,9 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
             if (message.payload.state.mixState) {
               setMixState(normaliseMixState(message.payload.state.mixState));
             }
+            setDeckMediaStates(
+              normaliseDeckMediaStates(message.payload.state.deckMediaStates ?? null),
+            );
             break;
           }
           case 'fallback-layers': {
@@ -172,6 +222,18 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
           }
           case 'mix-state': {
             setMixState(normaliseMixState(message.payload));
+            break;
+          }
+          case 'deck-media-state': {
+            setDeckMediaStates((previous) => ({
+              ...previous,
+              [message.payload.deck]: {
+                ...previous[message.payload.deck],
+                ...normaliseDeckMediaStates({ [message.payload.deck]: message.payload.state })[
+                  message.payload.deck
+                ],
+              },
+            }));
             break;
           }
           case 'update-mix-deck': {
@@ -265,6 +327,7 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     viewerStatus,
     assets,
     mixState,
+    deckMediaStates,
     send,
   };
 }

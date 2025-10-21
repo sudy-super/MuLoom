@@ -4,8 +4,10 @@ import { ShaderFallbackLayer, VideoFallbackLayer } from '../components/FallbackL
 import { AudioInput, type AudioAnalysis } from '../modules/AudioInput';
 import { GLSLGenerator, type ModelProvider } from '../modules/GLSLGenerator';
 import { GLSLRenderer } from '../modules/GLSLRenderer';
+import { useViewerCapture } from '../modules/useViewerCapture';
+import { useRTCStreaming } from '../modules/useRTCStreaming';
 import { useRealtime } from '../modules/useRealtime';
-import type { StartVisualizationPayload } from '../types/realtime';
+import type { RTCSignalMessage, StartVisualizationPayload } from '../types/realtime';
 import { computeDeckMix, type DeckKey, MIX_DECK_KEYS } from '../utils/mix';
 import '../App.css';
 
@@ -44,12 +46,110 @@ const ViewerPage = () => {
   const regenerateShaderRef = useRef<() => void>(() => {});
   const setSensitivityRef = useRef<(value: number) => void>(() => {});
 
-  const { assets, mixState, send } = useRealtime('viewer', {
+  const rtcSignalHandlersRef = useRef<{
+    handleRemoteAnswer: (answer: RTCSessionDescriptionInit) => Promise<boolean>;
+    addRemoteIceCandidate: (candidate: RTCIceCandidateInit) => Promise<boolean>;
+  }>({
+    handleRemoteAnswer: async () => false,
+    addRemoteIceCandidate: async () => false,
+  });
+  const startStreamingRef = useRef<() => Promise<void>>(async () => {});
+
+  const { assets, mixState, deckMediaStates, send } = useRealtime('viewer', {
     onStartVisualization: (payload) => startVisualizationRef.current(payload),
     onStopVisualization: () => stopVisualizationRef.current(),
     onRegenerateShader: () => regenerateShaderRef.current(),
     onSetAudioSensitivity: (value) => setSensitivityRef.current(value),
+    onRTCSignal: async (signal: RTCSignalMessage) => {
+      switch (signal.rtc) {
+        case 'answer': {
+          await rtcSignalHandlersRef.current.handleRemoteAnswer(signal.payload);
+          break;
+        }
+        case 'ice-candidate': {
+          await rtcSignalHandlersRef.current.addRemoteIceCandidate(signal.payload);
+          break;
+        }
+        case 'request-offer': {
+          await startStreamingRef.current();
+          break;
+        }
+        default: {
+          break;
+        }
+      }
+    },
   });
+
+  const { startCapture, stopCapture } = useViewerCapture({ frameRate: 30, quality: 0.85 });
+
+  const sendRTCSignal = useCallback(
+    (signal: Omit<RTCSignalMessage, 'type'>) => {
+      send({
+        type: 'rtc-signal',
+        rtc: signal.rtc,
+        payload: signal.payload,
+      });
+    },
+    [send],
+  );
+
+  const {
+    connectionState: rtcConnectionState,
+    initBroadcaster,
+    handleRemoteAnswer,
+    addRemoteIceCandidate,
+    closeConnection,
+  } = useRTCStreaming(sendRTCSignal);
+
+  const isStartingStreamRef = useRef(false);
+  const hasConnectedStreamRef = useRef(false);
+
+  rtcSignalHandlersRef.current = {
+    handleRemoteAnswer,
+    addRemoteIceCandidate,
+  };
+
+  const startStreaming = useCallback(async () => {
+    if (isStartingStreamRef.current) {
+      return;
+    }
+    isStartingStreamRef.current = true;
+    try {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        return;
+      }
+      if (!rendererRef.current) {
+        rendererRef.current = new GLSLRenderer(canvas);
+      }
+      if (!rendererRef.current) {
+        return;
+      }
+      hasConnectedStreamRef.current = false;
+      closeConnection();
+      stopCapture();
+      const stream = await startCapture(canvas);
+      if (!stream) {
+        return;
+      }
+      const offer = await initBroadcaster(stream);
+      if (!offer) {
+        return;
+      }
+      send({
+        type: 'rtc-signal',
+        rtc: 'offer',
+        payload: offer,
+      });
+    } catch (error) {
+      console.error('ViewerPage: failed to start RTC streaming.', error);
+    } finally {
+      isStartingStreamRef.current = false;
+    }
+  }, [closeConnection, initBroadcaster, send, startCapture, stopCapture]);
+
+  startStreamingRef.current = startStreaming;
 
   const registerFallbackAudioHandler = useCallback(
     (key: string, handler: (data: AudioAnalysis, sensitivity: number) => void) => {
@@ -62,10 +162,6 @@ const ViewerPage = () => {
   );
 
   useEffect(() => {
-    if (canvasRef.current && !rendererRef.current) {
-      rendererRef.current = new GLSLRenderer(canvasRef.current);
-    }
-
     return () => {
       if (glslGeneratorRef.current) {
         glslGeneratorRef.current.destroy();
@@ -87,8 +183,43 @@ const ViewerPage = () => {
         audioUnsubscribeRef.current();
         audioUnsubscribeRef.current = null;
       }
+      stopCapture();
+      closeConnection();
+      isStartingStreamRef.current = false;
+      hasConnectedStreamRef.current = false;
     };
-  }, []);
+  }, [closeConnection, stopCapture]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const attemptStart = () => {
+      if (cancelled) {
+        return;
+      }
+      if (!canvasRef.current) {
+        requestAnimationFrame(attemptStart);
+        return;
+      }
+      void startStreaming();
+    };
+
+    attemptStart();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [startStreaming]);
+
+  useEffect(() => {
+    if (rtcConnectionState === 'connected') {
+      hasConnectedStreamRef.current = true;
+      return;
+    }
+    if (rtcConnectionState === 'disconnected' && hasConnectedStreamRef.current) {
+      void startStreaming();
+    }
+  }, [rtcConnectionState, startStreaming]);
 
   useEffect(() => {
     send({
@@ -310,7 +441,7 @@ const ViewerPage = () => {
     }
   }, []);
 
-  const { outputs: deckOutputs } = computeDeckMix(mixState);
+  const { outputs: deckOutputs, hasActiveOutput } = computeDeckMix(mixState);
 
   const renderDeckLayer = (deckKey: DeckKey) => {
     const deck = mixState?.decks?.[deckKey];
@@ -360,6 +491,7 @@ const ViewerPage = () => {
           src={video.url}
           opacity={effectiveOpacity}
           blendMode={blendMode}
+          mediaState={deckMediaStates?.[deckKey]}
         />
       );
     }
@@ -380,7 +512,12 @@ const ViewerPage = () => {
 
   return (
     <div className="app viewer-app">
-      <canvas ref={canvasRef} className="glsl-canvas" />
+      <canvas
+        ref={canvasRef}
+        className="glsl-canvas"
+        style={{ opacity: hasActiveOutput ? 0 : 1, pointerEvents: hasActiveOutput ? 'none' : 'auto' }}
+        aria-hidden={hasActiveOutput}
+      />
       <CodeEditor code={generatedCode} isVisible={isGenerating} />
       <div className="mix-layer-stack">
         {MIX_DECK_KEYS.map((key) => renderDeckLayer(key))}

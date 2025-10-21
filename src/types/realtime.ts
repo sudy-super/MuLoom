@@ -1,4 +1,5 @@
 import type { ModelProvider } from '../modules/GLSLGenerator';
+import type { DeckKey } from '../utils/mix';
 
 export type LayerType = 'shader' | 'video';
 
@@ -53,6 +54,24 @@ export interface ControlSettings {
   prompt: string;
 }
 
+export interface DeckMediaStatus {
+  isPlaying: boolean;
+  progress: number;
+  isLoading: boolean;
+  error: boolean;
+  src: string | null;
+}
+
+export const createDefaultDeckMediaStatus = (): DeckMediaStatus => ({
+  isPlaying: false,
+  progress: 0,
+  isLoading: false,
+  error: false,
+  src: null,
+});
+
+export type DeckMediaStatusMap = Record<DeckKey, DeckMediaStatus>;
+
 export interface ViewerStatus {
   isRunning: boolean;
   isGenerating: boolean;
@@ -68,6 +87,19 @@ export interface StartVisualizationPayload {
   prompt: string;
 }
 
+export interface DeckMediaStateMessagePayload {
+  deck: DeckKey;
+  state: DeckMediaStatus;
+}
+
+export type RTCSignalType = 'offer' | 'answer' | 'ice-candidate' | 'request-offer';
+
+export type RTCSignalMessage =
+  | { type: 'rtc-signal'; rtc: 'offer'; payload: RTCSessionDescriptionInit }
+  | { type: 'rtc-signal'; rtc: 'answer'; payload: RTCSessionDescriptionInit }
+  | { type: 'rtc-signal'; rtc: 'ice-candidate'; payload: RTCIceCandidateInit }
+  | { type: 'rtc-signal'; rtc: 'request-offer'; payload: null };
+
 export type OutboundMessage =
   | { type: 'register'; role: 'viewer' | 'controller' }
   | { type: 'update-fallback-layers'; payload: FallbackLayer[] }
@@ -79,10 +111,24 @@ export type OutboundMessage =
   | { type: 'regenerate-shader' }
   | { type: 'set-audio-sensitivity'; payload: { value: number } }
   | { type: 'viewer-status'; payload: Partial<ViewerStatus> }
-  | { type: 'code-progress'; payload: { code: string; isComplete: boolean } };
+  | { type: 'code-progress'; payload: { code: string; isComplete: boolean } }
+  | { type: 'deck-media-state'; payload: DeckMediaStateMessagePayload }
+  | RTCSignalMessage;
 
 export type InboundMessage =
-  | { type: 'init'; payload: { state: { fallbackLayers: FallbackLayer[]; controlSettings: ControlSettings; viewerStatus: ViewerStatus; mixState: MixState }; assets: FallbackAssets } }
+  | {
+      type: 'init';
+      payload: {
+        state: {
+          fallbackLayers: FallbackLayer[];
+          controlSettings: ControlSettings;
+          viewerStatus: ViewerStatus;
+          mixState: MixState;
+          deckMediaStates?: DeckMediaStatusMap;
+        };
+        assets: FallbackAssets;
+      };
+    }
   | { type: 'fallback-layers'; payload: FallbackLayer[] }
   | { type: 'control-settings'; payload: ControlSettings }
   | { type: 'mix-state'; payload: MixState }
@@ -93,4 +139,6 @@ export type InboundMessage =
   | { type: 'start-visualization'; payload: StartVisualizationPayload }
   | { type: 'stop-visualization' }
   | { type: 'regenerate-shader' }
-  | { type: 'set-audio-sensitivity'; payload: { value: number } };
+  | { type: 'set-audio-sensitivity'; payload: { value: number } }
+  | { type: 'deck-media-state'; payload: DeckMediaStateMessagePayload }
+  | RTCSignalMessage;

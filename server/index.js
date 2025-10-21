@@ -87,6 +87,14 @@ const defaultMixDeck = () => ({
   enabled: false,
 });
 
+const defaultDeckMediaState = () => ({
+  isPlaying: false,
+  progress: 0,
+  isLoading: false,
+  error: false,
+  src: null,
+});
+
 const state = {
   fallbackLayers: [],
   controlSettings: {
@@ -111,6 +119,12 @@ const state = {
       d: defaultMixDeck(),
     },
   },
+  deckMediaStates: {
+    a: defaultDeckMediaState(),
+    b: defaultDeckMediaState(),
+    c: defaultDeckMediaState(),
+    d: defaultDeckMediaState(),
+  },
 };
 
 const clients = new Set();
@@ -130,8 +144,8 @@ function broadcast(message, options = {}) {
     }
     if (client.ws.readyState === client.ws.OPEN) {
       client.ws.send(payload);
+    }
   }
-}
 }
 
 const crossfaderFieldMap = {
@@ -154,6 +168,26 @@ function applyCrossfaderUpdate(payload) {
   state.mixState[field] = value;
   broadcastMixState();
   return true;
+}
+
+function handleRTCSignaling(message, ws) {
+  if (!message || typeof message.rtc !== 'string') {
+    return;
+  }
+
+  const rtcType = message.rtc.trim().toLowerCase();
+  if (!['offer', 'answer', 'ice-candidate', 'request-offer'].includes(rtcType)) {
+    return;
+  }
+
+  broadcast(
+    {
+      type: 'rtc-signal',
+      rtc: rtcType,
+      payload: message.payload ?? null,
+    },
+    { exclude: ws },
+  );
 }
 
 app.get('/api/fallback-assets', (_req, res) => {
@@ -419,6 +453,37 @@ wss.on('connection', (ws) => {
       }
       case 'code-progress': {
         broadcast(message, { exclude: ws });
+        break;
+      }
+      case 'deck-media-state': {
+        const deck = message.payload?.deck;
+        const deckState = message.payload?.state;
+        if (deck && state.deckMediaStates[deck] && deckState) {
+          state.deckMediaStates[deck] = {
+            isPlaying: Boolean(deckState.isPlaying),
+            progress: Math.max(0, Math.min(100, Number(deckState.progress ?? 0))),
+            isLoading: Boolean(deckState.isLoading),
+            error: Boolean(deckState.error),
+            src:
+              typeof deckState.src === 'string' && deckState.src.trim().length > 0
+                ? deckState.src
+                : null,
+          };
+          broadcast(
+            {
+              type: 'deck-media-state',
+              payload: {
+                deck,
+                state: state.deckMediaStates[deck],
+              },
+            },
+            { exclude: ws },
+          );
+        }
+        break;
+      }
+      case 'rtc-signal': {
+        handleRTCSignaling(message, ws);
         break;
       }
       default: {
